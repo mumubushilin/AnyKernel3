@@ -1,0 +1,103 @@
+name: Build kernelsu.ko with KPM (LKM)
+
+# 只编 kernelsu.ko（内核模块），不编内核。
+# 你的 root 是通过 init_boot 的 ramdisk 里那份 kernelsu.ko 提供的，
+# 所以换掉它就能拿到 KPM，不用动 boot 分区的内核 Image。
+#
+# 产物：kernelsu-kpm-android15-6.6 / kernelsu.ko
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'KMI 版本'
+        required: true
+        default: 'android15-6.6'
+        type: choice
+        options:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+      ddk_release:
+        description: 'DDK 发行版号'
+        required: true
+        default: '20260828'
+        type: string
+      nova_ref:
+        description: 'SukiSU-Nova 分支或标签'
+        required: true
+        default: 'v3.0.0'
+        type: string
+      version_code:
+        description: 'KernelSU 版本号（须与现有管理器 35038 一致）'
+        required: true
+        default: '35038'
+        type: string
+
+jobs:
+  build:
+    name: kernelsu.ko (${{ inputs.kmi }}) + KPM
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi }}-${{ inputs.ddk_release }}
+      options: --privileged
+    env:
+      KMI: ${{ inputs.kmi }}
+      KSU_VERSION_CODE: ${{ inputs.version_code }}
+      NOVA_REF: ${{ inputs.nova_ref }}
+
+    steps:
+      - name: 取 SukiSU-Nova 源码
+        run: |
+          set -eux
+          git clone --depth 1 --branch "$NOVA_REF" \
+            https://github.com/SukiSU-Nova/SukiSU-Nova.git src
+          cd src
+          git rev-parse HEAD
+          ls kernel
+
+      - name: 编译 kernelsu.ko（CONFIG_KPM=y）
+        run: |
+          set -eux
+          cd src/kernel
+          set -- CONFIG_KSU=m CONFIG_KPM=y CC=clang
+          set -- "$@" "KSU_VERSION=${KSU_VERSION_CODE}"
+          set -- "$@" "KSU_PACKAGE_NAME=com.sukisu.nova"
+          make "$@"
+          ls -la kernelsu.ko
+
+      - name: 校验 KPM 真的编进去了
+        run: |
+          set -eux
+          cd src/kernel
+          strings kernelsu.ko | grep -q 'sukisu_kpm_bridge'
+          echo "OK: sukisu_kpm_bridge 存在"
+          strings kernelsu.ko | grep -E 'SUKISU_KPM_(LOAD|UNLOAD|LIST|VERSION)' | sort -u
+          echo "--- vermagic ---"
+          strings kernelsu.ko | grep '^vermagic=' || true
+          echo "--- size ---"
+          stat -c %s kernelsu.ko
+
+      - name: 收集产物
+        run: |
+          set -eux
+          mkdir -p out
+          cd src/kernel
+          llvm-strip -d kernelsu.ko || true
+          cp kernelsu.ko "$GITHUB_WORKSPACE/out/kernelsu.ko"
+          cd "$GITHUB_WORKSPACE/out"
+          sha256sum kernelsu.ko
+          stat -c %s kernelsu.ko
+
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-kpm-${{ inputs.kmi }}
+          path: out/kernelsu.ko
+          if-no-files-found: error
+          retention-days: 14
